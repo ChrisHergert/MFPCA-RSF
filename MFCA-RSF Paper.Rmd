@@ -1,0 +1,1521 @@
+---
+output:
+  pdf_document:
+    keep_tex: true
+    includes:
+      in_header: preamble.tex
+    latex_engine: pdflatex
+header-includes:
+  - \usepackage{multicol}
+title: ""
+fontsize: 12pt
+documentclass: article
+---
+\LARGE\textbf{Predicting Alzheimer's Disease Progression at MCI Onset: A Survival Moderling Approach Using Longitudinal Biomarkers and MFPCA in Random Survival Forests} 
+
+\large
+C Hergert\textsuperscript{1,*}, Y Jung\textsuperscript{1}
+
+\small 
+
+\textsuperscript{1}Statistics, Texas A\&M University, USA
+
+\textsuperscript{*}Corresponding author: chris\_hergert\@tamu.edu
+
+\onehalfspacing
+
+
+``` {r loadPackages, echo=FALSE, message=FALSE, warning=FALSE, include=FALSE, results='hide'}
+library('tidyverse')
+library('readxl')
+require(kableExtra) #for pretty tables
+library(survival)
+library(survminer)
+library(ggsurvfit)
+library(caret) #CreateDataSplit
+library("randomForestSRC") #random survival forest models
+
+### MFPCA-supporting libraries
+require(funData) #funData data type
+source("C:\\Users\\Chris\\Desktop\\School\\STAT 685 - Directed Study\\Li_code\\functions.R")
+library(MFPCA) #PACE function
+
+### For plotting
+library(ggplot2)
+library(scales)
+library(gridExtra)
+library(ggthemes)
+# install.packages("ggthemes")
+library(tibble) #this is just for rownames_to_column()
+
+library(ggfortify) #for autoplot(), used in the Kaplan-Meier plots
+library(naniar) #For missingness plots
+library(ggpubr) #for ggarrange - 2x2 plot grid w/ common legend
+
+seed_int=685
+
+```
+
+``` {r read_in_and_format, echo=FALSE, message=FALSE, warning=FALSE, include=FALSE, results='hide'}
+
+#### THIS IS THE SAME DATA SET AS THE LI/LUO STUDY
+adni1_source <- read_xlsx('C:\\Users\\Chris\\Desktop\\School\\STAT 685 - Directed Study\\Data Files\\ADNI\\ACOG.xlsx',
+                          sheet='ADNI1_BASE') #--> This one works, but I'm not sure if it's right
+
+I=300
+
+# survival model 
+##### CREATE THE SURV.TRAIN and SURV.TEST DATA SETS
+surv <- adni1_source %>% 
+        mutate(   PATIENT_ID = PTID,
+                  COG13        = ADAS13,
+                  EDU_YEARS    = PTEDUCAT,
+                  GENDER       = PTGENDER,
+                  AD_STATUS    = CONV_FLAG,
+                  t_REGMONTHS  = t_m_reg3,
+                  t_MONTHS     = t_months,
+                  EVENT        = case_when(DX=='Dementia' ~ 1, .default=0),
+                  APOE_PRESENT = case_when(APOE4 > 0 ~ 1, .default=0),
+                  FAQ          = replace_na(FAQ,   median(FAQ, na.rm=TRUE)),
+                  MMSE         = replace_na(MMSE,  median(MMSE, na.rm=TRUE)),
+                  COG13        = replace_na(COG13, median(COG13, na.rm=TRUE)),
+                  ADASQ4       = replace_na(ADASQ4, median(ADASQ4, na.rm=TRUE)),
+                  FAQ_bl       = replace_na(FAQ_bl, median(FAQ_bl, na.rm=TRUE)),
+                  MMSE_bl      = replace_na(MMSE_bl, median(FAQ_bl, na.rm=TRUE)),
+                  RAVLT_perc_forgetting_bl= replace_na(RAVLT_perc_forgetting_bl, median(RAVLT_perc_forgetting_bl, na.rm=TRUE)),
+                  RAVLT_immediate_bl= replace_na(RAVLT_immediate_bl, median(RAVLT_immediate_bl, na.rm=TRUE)),
+                  RAVLT_learning_bl= replace_na(RAVLT_learning_bl, median(RAVLT_learning_bl, na.rm=TRUE)),
+                  Hippocampus_bl= replace_na(Hippocampus_bl, median(Hippocampus_bl, na.rm=TRUE)),
+                  WholeBrain_bl= replace_na(WholeBrain_bl, median(WholeBrain_bl, na.rm=TRUE)),
+                  COG13_bl   =  replace_na(ADAS13_bl, median(ADAS13_bl, na.rm=TRUE)),
+                  ADASQ4_bl    = replace_na(ADASQ4_bl, median(ADASQ4_bl, na.rm=TRUE)),
+                  ) %>%
+        filter( #t_REGMONTHS <= 42 & 
+                  LAST_OBS == 1) %>%
+        dplyr::select(t, t_MONTHS, t_REGMONTHS, PATIENT_ID, AGE, GENDER, EDU_YEARS, EVENT, DX_bl, DX,
+               COG13, FAQ, APOE_PRESENT, MMSE, RAVLT_immediate,	RAVLT_learning,
+               ADASQ4, RAVLT_forgetting_bl, RAVLT_perc_forgetting_bl, FAQ_bl,
+               MMSE_bl, Hippocampus_bl, WholeBrain_bl, RAVLT_immediate_bl,
+               RAVLT_learning_bl, COG13_bl, ADASQ4_bl)
+
+# surv.train  <- surv[1:I,]
+# surv.test <- surv[(I+1):nrow(surv),] 
+
+### GET THE DATA
+surv2 <- surv %>%
+          dplyr::select(-c(t, t_MONTHS, DX, DX_bl, COG13, FAQ, MMSE, RAVLT_immediate, RAVLT_learning, ADASQ4, #PATIENT_ID
+                           )) %>% 
+          mutate(GENDER = as.numeric(GENDER=='Male')) %>%
+          filter(t_REGMONTHS > 0)
+
+### DO A TRAIN/TEST SPLIT
+  n          = nrow(surv2)
+  X <- surv %>% dplyr::select(-EVENT)
+  Y <- as.numeric(surv$EVENT)
+  
+  set.seed(seed_int)
+  trainIndex <- createDataPartition( y    = surv2$EVENT, 
+                                     p    = 0.75,
+                                     list = FALSE )
+  
+  role = rep('test', n)
+  role[trainIndex] = 'train'
+  surv.test   = surv2 %>% filter(role=='test') #%>% mutate(EVENT = as.factor(EVENT)) 
+  surv.train  = surv2 %>% filter(role=='train') #%>% mutate(EVENT = as.factor(EVENT))
+
+```
+
+``` {r basic_cox, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+cox_basic <- coxph(Surv(t_REGMONTHS, EVENT) ~ 
+                    AGE + APOE_PRESENT + MMSE_bl +
+                    RAVLT_perc_forgetting_bl + FAQ_bl + 
+                    Hippocampus_bl + RAVLT_immediate_bl #+ RAVLT_learning_bl
+                   ,
+      data=surv.train)
+
+surv.probs <- survfit(cox_basic, newdata=surv.test)
+cox.surv.probs <- survfit(cox_basic, newdata=surv.test)
+cox.surv.test <- surv.test
+
+
+```
+
+``` {r basic_cox_grading, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+# surv.test
+
+thresholds <- 
+  data.frame(cutoff     = seq(from=0.01,to=1,length.out=100),
+             #cutoff     = seq(from=0.86,to=0.88,length.out=100),
+            MSE         = array(0, 100),
+            forecasted  = array(NA,100),
+            CAUGHT_EARLY_n = array(NA,100),
+            avg.marg.early = array(NA,100),
+            avg.marg.late  = array(NA,100))
+opt_survprobs_cox = NA
+opt_survprobs_cox_MSE = 10000000000
+
+
+for (i in 1:100){
+    # threshold <- 0.84 #--> This is the optimal threshold to minimize the MSE
+     # threshold <- 0.93
+
+    threshold = thresholds$cutoff[i]
+    survProbsDF <-  surv.test %>%
+                    dplyr::select(PATIENT_ID, EVENT, t_REGMONTHS) %>%
+                    cbind(
+                        data.frame(
+                            t6 = t(summary(surv.probs, times=6)$surv),
+                            t12= t(summary(surv.probs, times=12)$surv),
+                            t18= t(summary(surv.probs, times=18)$surv),
+                            t24= t(summary(surv.probs, times=24)$surv),
+                            t30= t(summary(surv.probs, times=30)$surv),
+                            t36= t(summary(surv.probs, times=36)$surv),
+                            t42= t(summary(surv.probs, times=42)$surv),
+                            t48= t(summary(surv.probs, times=48)$surv),
+                            t54= rep(0.01,nrow(surv.test)   ) ) 
+                        ) %>%
+                    filter(t_REGMONTHS>0 & EVENT==1) %>%
+                    mutate(E6  = case_when(t6   < threshold ~ 1, .default = 0),
+                           E12  = case_when(t12 < threshold ~ 1, .default = 0),
+                           E18  = case_when(t18 < threshold ~ 1, .default = 0),
+                           E24  = case_when(t24 < threshold ~ 1, .default = 0),
+                           E30  = case_when(t30 < threshold ~ 1, .default = 0),
+                           E36  = case_when(t36 < threshold ~ 1, .default = 0),
+                           E42  = case_when(t42 < threshold ~ 1, .default = 0),
+                           E48  = case_when(t48 < threshold ~ 1, .default = 0),
+                           t_REGMONTHS_PRED = case_when(t6  < threshold ~ 6,
+                                                        t12 < threshold ~ 12,
+                                                        t18 < threshold ~ 18,
+                                                        t24 < threshold ~ 24,
+                                                        t30 < threshold ~ 30,
+                                                        t36 < threshold ~ 36,
+                                                        t42 < threshold ~ 42,
+                                                        t48 < threshold ~ 48,
+                                                        t54 < threshold ~ 54)
+                           )
+                    
+################# GET THE PREDICTION FOR HOW MANY WERE CAUGHT EARLY #########################
+    earlies <- survProbsDF %>%
+               mutate(CATCH_CASE  = case_when(t_REGMONTHS_PRED==t_REGMONTHS ~ 1, 
+                                              .default=0), # This indicates a spot-on prediction
+             margin      = abs(t_REGMONTHS_PRED-t_REGMONTHS),
+             catch_early = t_REGMONTHS_PRED <= t_REGMONTHS) %>%  #What was the absolute margin of error?
+      group_by(catch_early) %>% summarise(n=n(), avg.marg=mean(margin), med.marg=median(margin))
+
+    ### GET THE MSE AND COUNT OF SUCCESSFULY FORECASTS
+    thresholds$MSE[i]        <- mean( (survProbsDF$t_REGMONTHS - survProbsDF$t_REGMONTHS_PRED)**2, na.rm = TRUE)
+    thresholds$forecasted[i] <- 100-sum(is.na(survProbsDF))
+
+    thresholds$CAUGHT_EARLY_n[i] <- earlies %>% filter(catch_early==TRUE) %>% dplyr::select(n) %>% as.numeric()
+    thresholds$avg.marg.early[i] <- earlies %>% filter(catch_early==TRUE) %>% dplyr::select(avg.marg) %>% as.numeric()
+    thresholds$avg.marg.late[i]  <- earlies %>% filter(catch_early==TRUE) %>% dplyr::select(avg.marg) %>% as.numeric()
+
+############################################## RETAIN OPTIMAL SurvProbs matrix ###############
+    if (thresholds$MSE[i] < opt_survprobs_cox_MSE){
+      opt_survprobs_cox <- survProbsDF
+      opt_survprobs_cox_MSE <- thresholds$MSE[i]
+    }
+
+}
+  
+
+# thresholds
+################################# NOTES ################################################
+
+### Conclusions: Minimizes MSE at thresh=0.868
+  #--> MSE = 159.2526, 96/102 forecasted, 66 caught early
+  #--> What if we want to prioritize catching cases early? There is no clearly best threshold here, as 0.94 offers the best tradeoff of catching ~85% of cases early, but the avg./med. MoE is drastically larger than in the MFPCCox model, now at 13.57 months. If the requirement that the margin of error be kept under one year is included, then the best possible coverage for early prediction is 76/102 at thresh=0.90.
+
+##### THINGS ARE GETTING MIXED UP.
+  # FILTERING TO ONLY EVENT==1
+  
+  ## BASIC MODEL:
+    # It's MSE-optimal at 0.81, where the MSE Is 104.625, and only 32/40 cases are caught early. The MoE = 6.871 months.
+    # It's diagnostic-optimal at 0.936, where MSE=179.325, 37/40 cases are caught early, and MoE = 10.30 months
+
+  ## MFPCCox Model
+    # MSE-optimal at 0.75, where MSE is 0.86.625, and only 29/40 cases are caught early. MoE is 5.48 months
+    # Diagnostic-optimal at 0.86, where MSE is 117.225 and 37/40 cases are caught early, with MoE=7.70 months
+
+################################# TROUBLESHOOTING ################################################
+
+
+```
+
+``` {r basic_RSF, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+################################################################
+## This is where we build the basic Random Survival Forest model given all of the viable predictors, but not the MFPCA components.
+################################################################
+
+  
+### BUILD THE RSF MODEL
+  
+  B = 400 #This is the number of bootstrapped samples that will be built
+  RF_fit_new <- rfsrc(Surv(t_REGMONTHS, EVENT)~., 
+                  data=as.data.frame(surv.train) %>% select(-PATIENT_ID), 
+                  ntree=B,
+                  membership=TRUE,
+                  importance=TRUE
+                  )
+  
+# ### PLOT IT
+# par(cex.axis = 1.0, cex.lab = 1.0, cex.main = 1.0, mar = c(6.0,6,1,1), mgp = c(4, 1, 0))
+# plot(round(y.pred$time.interest,2),y.pred$survival[1,], type="l", xlab="Time (Year)",   
+#    ylab="Survival", col=1, lty=1, lwd=2)
+# 
+# ### GRADE IT: GET THE BRIER SCORE CURVE
+#   ##--> Down the road, maybe also use C-index for grading models?
+# bs.km <- get.brier.survival(RF_fit, cens.model='km')$brier.score
+# plot(bs.km, type='s', col=2, ylab='Brier Score')
+# 
+# ### VIMP
+# vimp(RF_fit)
+
+### GET PREDICTION(S)
+y.pred=predict(RF_fit_new, newdata=as.data.frame(surv.test), na.action='na.impute')
+
+
+
+```
+
+``` {r basic_RSF_grading, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+################################################################
+## This is where we grade the basic RSF model's predictions and refine the thresholds:
+################################################################
+
+
+### RECOMBINE PATIENT_ID VALUES WITH PREDICTIONS
+ID.vars = surv %>% filter(t_REGMONTHS > 0) %>% filter(role=='test') %>% dplyr::select(PATIENT_ID, EVENT, t_REGMONTHS) # Get the patient IDs
+survProbsRSF           <- as.data.frame(y.pred$survival)  # convert the matrix of probabilities to a data frame
+colnames(survProbsRSF) <- paste0('t',y.pred$time.interest) # rename the columns to t<months_since_t0>
+survProbsRSF <- survProbsRSF %>% dplyr::select(any_of(c("PATIENT_ID", "EVENT", "t_REGMONTHS", 
+                                                        "t6", "t12", "t18", "t24", "t30", 
+                                                        "t36", "t42", "t48")))
+survProbsRSF <- cbind(ID.vars, survProbsRSF)
+RSF.surv.probs <- cbind(ID.vars, survProbsRSF)
+
+
+
+
+thresholds_RSF <- data.frame(cutoff        = seq(0.01,1,0.01), 
+                            MSE            = array(0, 100),
+                            forecasted     = array(NA,100),
+                            CAUGHT_EARLY_n = array(NA,100),
+                            avg.marg.early = array(NA,100),
+                            avg.marg.late  = array(NA,100))
+opt_survprobs_RSF = NA
+opt_survprobs_RSF_MSE = 10000000000
+
+            
+for (i in 1:100){
+    # threshold <- 0.84 #--> This is the optimal threshold to minimize the MSE
+    # threshold <- 0.07
+  
+    threshold = thresholds_RSF$cutoff[i]
+    survProbsDF <- survProbsRSF
+    
+    survProbsRSF_DF <-  survProbsRSF %>% 
+                        filter(t_REGMONTHS>0 & EVENT==1) %>%
+                        mutate( E6  = case_when(t6   < threshold ~ 1, .default = 0),
+                                E12  = case_when(t12 < threshold ~ 1, .default = 0),
+                                E18  = case_when(t18 < threshold ~ 1, .default = 0),
+                                E24  = case_when(t24 < threshold ~ 1, .default = 0),
+                                E30  = case_when(t30 < threshold ~ 1, .default = 0),
+                                E36  = case_when(t36 < threshold ~ 1, .default = 0),
+                                E42  = case_when(t42 < threshold ~ 1, .default = 0),
+                                E48  = case_when(t48 < threshold ~ 1, .default = 0),
+                                t_REGMONTHS_PRED = case_when(t6  < threshold ~ 6,
+                                                             t12 < threshold ~ 12,
+                                                             t18 < threshold ~ 18,
+                                                             t24 < threshold ~ 24,
+                                                             t30 < threshold ~ 30,
+                                                             t36 < threshold ~ 36,
+                                                             t42 < threshold ~ 42,
+                                                             t48 < threshold ~ 48,
+                                                             .default = 54) #Impose an upper bound. May delete.
+                                                    )
+    
+    ### GET THE COUNT OF HOW MANY WERE CAUGHT EARLY
+    earlies_RSF <-
+      survProbsRSF_DF %>%
+      mutate(CATCH_CASE  = case_when(t_REGMONTHS_PRED==t_REGMONTHS ~ 1, .default=0), # This indicates a spot-on prediction
+             margin      = abs(t_REGMONTHS_PRED-t_REGMONTHS),
+             catch_early = t_REGMONTHS_PRED <= t_REGMONTHS) %>%  #What was the absolute margin of error?
+      group_by(catch_early) %>% summarise(n=n(), avg.marg=round(mean(margin),3), med.marg=round(median(margin),3) )
+
+    ### GET THE MSE AND COUNT OF SUCCESSFULY FORECASTS
+    thresholds_RSF$MSE[i]        <- mean( (survProbsRSF_DF$t_REGMONTHS - survProbsRSF_DF$t_REGMONTHS_PRED)**2, na.rm = TRUE)
+    thresholds_RSF$forecasted[i] <- 100-sum(is.na(survProbsRSF_DF))
+
+    thresholds_RSF$CAUGHT_EARLY_n[i] <- earlies_RSF %>% filter(catch_early==TRUE) %>% dplyr::select(n) %>% as.numeric()
+    thresholds_RSF$avg.marg.early[i] <- earlies_RSF %>% filter(catch_early==TRUE) %>% dplyr::select(avg.marg) %>% as.numeric()
+    thresholds_RSF$avg.marg.late[i]  <- earlies_RSF %>% filter(catch_early==TRUE) %>% dplyr::select(avg.marg) %>% as.numeric()
+    
+    ############################################## RETAIN OPTIMAL SurvProbs matrix ###############
+    if (thresholds_RSF$MSE[i] < opt_survprobs_RSF_MSE){
+      opt_survprobs_RSF <- survProbsRSF_DF
+      opt_survprobs_RSF_MSE <- thresholds_RSF$MSE[i]
+    }
+    
+}
+
+#thresholds_RSF
+
+#Benchmarking and thresholding:
+  # If we're looking at this in an MSE-optimal case, then the optimal threshold is 0.77, where MSE=120.4468 and 33/47 cases are caught early. The mean/med. MoE is 7.727 months
+    ## This is a better variance than the Cox models, but it's inferior for predictive power.
+
+  # If we're looking at the diagnostic-optimal conditions, then we suggest using 0.94 for the threshold. This affords us a 44/47 early catch rate, with a much worse MoE of 10.977 months.
+
+
+```
+
+``` {r RSF_with_MFPCA, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+################### STEP 0: TRAIN/TEST SPLIT ########################################
+surv2 <- surv %>%
+          dplyr::select(-c(t, t_MONTHS, DX, DX_bl, COG13, FAQ, MMSE, RAVLT_immediate, RAVLT_learning, ADASQ4 )) %>% 
+          mutate(GENDER = as.numeric(GENDER=='Male')) %>%
+          filter(t_REGMONTHS > 0)
+
+### DO A TRAIN/TEST SPLIT
+  n          = nrow(surv2)
+  X <- surv %>% dplyr::select(-EVENT)
+  Y <- as.numeric(surv$EVENT)
+  
+  set.seed(seed_int)
+  trainIndex <- createDataPartition( y    = surv2$EVENT, 
+                                     p    = 0.75,
+                                     list = FALSE )
+  
+  role = rep('test', n)
+  role[trainIndex] = 'train'
+  surv.test   = surv2 %>% filter(role=='test') #%>% mutate(EVENT = as.factor(EVENT)) 
+  surv.train  = surv2 %>% filter(role=='train') #%>% mutate(EVENT = as.factor(EVENT))
+
+################### Step 1: GET THE MFPCA COMPONENTS #################################
+
+adni1 <- adni1_source %>%
+  mutate(
+    PATIENT_ID = PTID,
+    COG13      = ADAS13,
+    COG13_bl   = ADAS13_bl,
+    EDU_YEARS  = PTEDUCAT,
+    GENDER     = PTGENDER,
+    AD_STATUS  = CONV_FLAG,
+    t_REGMONTHS= t_m_reg3,
+    t_MONTHS   = t_months,
+    # AGE_ADJ    = AGE + t_m_reg/6,
+    APOE_PRESENT = case_when(APOE4 > 0 ~ 1,
+                             .default=0),
+    EVENT      = case_when(DX=='Dementia' ~ 1, .default=0)
+  ) %>%
+  filter( t_REGMONTHS <= 42) %>%
+  dplyr::select(t, t_MONTHS, t_REGMONTHS, PATIENT_ID, AGE, GENDER, EDU_YEARS, EVENT, DX_bl, DX,
+         COG13, FAQ, APOE_PRESENT, MMSE, RAVLT_immediate,	RAVLT_learning)
+  
+  
+  adni1.test  <- adni1[adni1$PATIENT_ID %in% surv.test$PATIENT_ID, ]
+  adni1.train <- adni1[adni1$PATIENT_ID %in% surv.train$PATIENT_ID, ]
+
+  
+  obstime = c(0,3,6,9,12,15,18,21,24,27,30,33,36,39,42, 45, 48, 51, 54) # longitudinal measurement time
+  argvals = obstime/21 # scale the time domain to [0,1]
+  scenario = "linear_no_missing"
+  patID = unique(adni1.train$PATIENT_ID)
+  nPat = length(patID)
+  
+  # transfer longitudinal outcomes from long to wide
+  multivar = array(NA, c((length(patID)), length(obstime), 5))
+  for (i in 1:nPat){
+    visits = which(obstime %in% (adni1.train$t_REGMONTHS[adni1.train$PATIENT_ID==patID[i]] ) )
+    multivar[i,visits, 1] = adni1.train$COG13[          adni1.train$PATIENT_ID==patID[i] ]
+    multivar[i,visits, 2] = adni1.train$MMSE[           adni1.train$PATIENT_ID==patID[i] ]
+    multivar[i,visits, 3] = adni1.train$RAVLT_immediate[adni1.train$PATIENT_ID==patID[i] ]
+    multivar[i,visits, 4] = adni1.train$RAVLT_learning[ adni1.train$PATIENT_ID==patID[i] ]
+    multivar[i,visits, 5] = adni1.train$FAQ[            adni1.train$PATIENT_ID==patID[i] ]
+  }
+
+
+  # CREATE MATRIX-FORMATTED TRAINING DATA SET
+  multivar.train = multivar
+  Xi.train = L = phi.train = meanFun.train =  NULL
+  
+  # library(refund)
+    ### I DON'T REALLY KNOW WHAT'S HAPPENING HERE. I THINK THIS IS THE FIRST STEP OF MFPCA.
+    for(p in 1:5){
+      tmp.ufpca = uPACE(multivar.train[,,p], argvals, nbasis=5)
+      Xi.train = cbind(Xi.train, tmp.ufpca$scores) # FPC scores
+      L = c(L, dim(tmp.ufpca$scores)[2])
+      phi.train[[p]] = t(tmp.ufpca$functions@X) # FPC eigenfunctions
+      meanFun.train[[p]] = tmp.ufpca$mu@X # estimated mean functions
+    }
+    
+  # multivariate FPCA
+  mFPCA.train = mFPCA(Xi=Xi.train, phi=phi.train, p=5, L=L )
+  rho.train = mFPCA.train$rho  #MFPC scores
+  pve = mFPCA.train$pve
+  psi = mFPCA.train$psi
+  Cms = mFPCA.train$Cms
+
+################### Step 2: BUILD THE MFPCA REGRESSION MODELS #################################
+  ## Use surv.train MMSE_bl, FAQ_bl, RAVLT_immediate_bl, RAVLT_learning_bl, and ADAS13_bl to predict x1, ..., x6 from rho.train
+    regr.train <- surv.train %>% 
+                  cbind(data.frame(rho.train)) %>% 
+                  select(-c(PATIENT_ID, EVENT, t_REGMONTHS, WholeBrain_bl, Hippocampus_bl,
+                            AGE, APOE_PRESENT, RAVLT_perc_forgetting_bl)) %>%
+                  select(-any_of(c("X6")))
+  
+    x1_dta <- regr.train %>% select(-c("X2", "X3", "X4", "X5") )
+    x2_dta <- regr.train %>% select(-c("X1", "X3", "X4", "X5") )
+    x3_dta <- regr.train %>% select(-c("X1", "X2", "X4", "X5") )
+    x4_dta <- regr.train %>% select(-c("X1", "X2", "X3", "X5") )
+    x5_dta <- regr.train %>% select(-c("X1", "X2", "X3", "X4") )
+    # x6_dta <- regr.train %>% select(-c("X1", "X2", "X3", "X4") )
+    
+    x1_fit <- lm(X1 ~., data = x1_dta )
+    x2_fit <- lm(X2 ~., data = x2_dta )
+    x3_fit <- lm(X3 ~., data = x3_dta )
+    x4_fit <- lm(X4 ~., data = x4_dta )
+    x5_fit <- lm(X5 ~., data = x5_dta )
+    # x6_fit <- lm(X6 ~., data = x6_dta )
+    
+            # summary(x2_fit)
+
+  ## Get the predictions for surv.test
+    regr.test = data.frame(X1 = predict(x1_fit, newdata=surv.test), 
+                           X2 = predict(x2_fit, newdata=surv.test),
+                           X3 = predict(x3_fit, newdata=surv.test), 
+                           X4 = predict(x4_fit, newdata=surv.test),
+                           X5 = predict(x5_fit, newdata=surv.test))
+    regr.test = cbind(surv.test, regr.test)
+    # regr.test
+  
+  ## Build the RSF model from surv.train
+    ### BUILD THE RSF MODEL
+        regr.train2 <- surv.train %>% 
+                        cbind(data.frame(rho.train)) %>% 
+                        select(-c(PATIENT_ID)) %>% 
+                        select(-any_of(c("X6"))) #%>%
+                         #dplyr::select(-c(AGE, APOE_PRESENT, GENDER, EDU_YEARS, MMSE_bl, RAVLT_learning_bl))
+  
+  
+        B = 400 #This is the number of bootstrapped samples that will be built
+        RSF_MFPCA <- rfsrc( Surv(t_REGMONTHS, EVENT)~., 
+                            data=regr.train2, 
+                            ntree=B,
+                            membership=TRUE,
+                            importance=TRUE
+                            )
+    
+  ## Get the RSF model predictions from surv.test
+      y.pred=predict(RSF_MFPCA, 
+                     newdata   = regr.test, 
+                     na.action ='na.impute')
+      
+      # colnames(regr.train2)
+      # colnames(regr.test)
+
+```
+
+``` {r RSF_with_MFPCA_grading, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+### 1. RECOMBINE PATIENT_ID VALUES WITH PREDICTIONS
+
+    ID.vars                <- regr.test %>% select(PATIENT_ID, EVENT, t_REGMONTHS)
+    survProbsRSF           <- as.data.frame(y.pred$survival)  # convert the matrix of probabilities to a data frame
+    colnames(survProbsRSF) <- paste0('t',y.pred$time.interest) # rename the columns to t<months_since_t0>
+    survProbsRSF <- survProbsRSF %>% dplyr::select(any_of(c("PATIENT_ID", "EVENT", "t_REGMONTHS", 
+                                                            "t6", "t12", "t18", "t24", "t30", 
+                                                            "t36", "t42", "t48")))
+    survProbsRSF <- cbind(ID.vars, survProbsRSF)
+    RSF.MFPCA.surv.probs <- cbind(ID.vars, survProbsRSF)
+
+### 2. Create cutoff thresholds
+
+thresholds_RSF_MFPCA <- data.frame( cutoff        = seq(0.01,1,0.01), 
+                                    MSE            = array(0, 100),
+                                    forecasted     = array(NA,100),
+                                    CAUGHT_EARLY_n = array(NA,100),
+                                    avg.marg.early = array(NA,100),
+                                    avg.marg.late  = array(NA,100))
+opt_survprobs_RSF_MFPCA = NA
+opt_survprobs_RSF_MFPCA_MSE = 10000000000
+
+            
+for (i in 1:100){
+    # threshold <- 0.84 #--> This is the optimal threshold to minimize the MSE
+    # threshold <- 0.07
+  
+    threshold = thresholds_RSF_MFPCA$cutoff[i]
+    survProbsDF <- survProbsRSF
+    
+    survProbsRSF_DF <-  survProbsRSF %>% 
+                        filter(t_REGMONTHS>0 & EVENT==1) %>%
+                        mutate( E6   = case_when(t6   < threshold ~ 1, .default = 0),
+                                E12  = case_when(t12 < threshold ~ 1, .default = 0),
+                                E18  = case_when(t18 < threshold ~ 1, .default = 0),
+                                E24  = case_when(t24 < threshold ~ 1, .default = 0),
+                                E30  = case_when(t30 < threshold ~ 1, .default = 0),
+                                E36  = case_when(t36 < threshold ~ 1, .default = 0),
+                                E42  = case_when(t42 < threshold ~ 1, .default = 0),
+                                E48  = case_when(t48 < threshold ~ 1, .default = 0),
+                                t_REGMONTHS_PRED = case_when(t6  < threshold ~ 6,
+                                                             t12 < threshold ~ 12,
+                                                             t18 < threshold ~ 18,
+                                                             t24 < threshold ~ 24,
+                                                             t30 < threshold ~ 30,
+                                                             t36 < threshold ~ 36,
+                                                             t42 < threshold ~ 42,
+                                                             t48 < threshold ~ 48,
+                                                             .default = 54) #Impose an upper bound. May delete.
+                                )
+    
+    ### GET THE COUNT OF HOW MANY WERE CAUGHT EARLY
+    earlies_RSF <-
+      survProbsRSF_DF %>%
+      mutate(CATCH_CASE  = case_when(t_REGMONTHS_PRED==t_REGMONTHS ~ 1, .default=0), # This indicates a spot-on prediction
+             margin      = abs(t_REGMONTHS_PRED-t_REGMONTHS),
+             catch_early = t_REGMONTHS_PRED <= t_REGMONTHS) %>%  #What was the absolute margin of error?
+      group_by(catch_early) %>% summarise(n=n(), avg.marg=round(mean(margin),3), med.marg=round(median(margin),3) )
+
+    ### GET THE MSE AND COUNT OF SUCCESSFULY FORECASTS
+    thresholds_RSF_MFPCA$MSE[i]        <- mean( (survProbsRSF_DF$t_REGMONTHS - survProbsRSF_DF$t_REGMONTHS_PRED)**2, na.rm = TRUE)
+    thresholds_RSF_MFPCA$forecasted[i] <- 100-sum(is.na(survProbsRSF_DF))
+
+    thresholds_RSF_MFPCA$CAUGHT_EARLY_n[i] <- earlies_RSF %>% filter(catch_early==TRUE) %>% dplyr::select(n) %>% as.numeric()
+    thresholds_RSF_MFPCA$avg.marg.early[i] <- earlies_RSF %>% filter(catch_early==TRUE) %>% dplyr::select(avg.marg) %>% as.numeric()
+    thresholds_RSF_MFPCA$avg.marg.late[i]  <- earlies_RSF %>% filter(catch_early==TRUE) %>% dplyr::select(avg.marg) %>% as.numeric()
+   
+    
+############################################## RETAIN OPTIMAL SurvProbs matrix ###############
+    if (thresholds_RSF_MFPCA$MSE[i] < opt_survprobs_RSF_MFPCA_MSE){
+      opt_survprobs_RSF_MFPCA <- survProbsRSF_DF
+      opt_survprobs_RSF_MFPCA_MSE <- thresholds_RSF_MFPCA$MSE[i]
+    }
+    
+}
+
+# thresholds_RSF_MFPCA
+
+#Benchmarking and thresholding:
+  # If we're looking at this in an MSE-optimal case, then the optimal threshold is 0.69, where MSE=107.027 and 19/37 cases are caught early. The mean/med. MoE is 7.263 months (vs 7.727 months for the basic RSF model)
+    ## This is a better variance than the Cox models, but it's inferior for predictive power.
+    ## Marginal variance improvement over basic RSF, but drastically worse predictive power.
+
+  # If we're looking at the diagnostic-optimal conditions, then we suggest using 0.9 (vs 0.94 for basic RSF) for the threshold. This affords us a 35/37 (marginally better than the 44/47 for basic RSF) early catch rate, and substantially improves the MoE of to 9.943 (vs 10.977 months for basic RSF).
+
+# plot(thresholds_RSF_MFPCA$cutoff, 
+#      thresholds_RSF_MFPCA$CAUGHT_EARLY_n/47, 
+#      type='l', col='red',
+#      ylab='Early Detection Rate', xlab='Threshold')
+
+
+```
+
+```{r MFPCCox, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+#### Just train w/ regr.train2
+# MFPCCox.fit = coxph(Surv(t_REGMONTHS, EVENT) ~ APOE_PRESENT + AGE + EDU_YEARS + FAQ_bl + MMSE_bl + 
+#                                                RAVLT_immediate_bl + COG13_bl + X1+X2+X3+X4+X5,
+#                                           data=regr.train2 )
+
+MFPCCox.fit = coxph(Surv(t_REGMONTHS, EVENT) ~ 
+                    AGE + APOE_PRESENT + MMSE_bl +
+                    RAVLT_perc_forgetting_bl + FAQ_bl + 
+                    Hippocampus_bl + RAVLT_immediate_bl+ X1+X2+X3+X4+X5, data=regr.train2 )
+
+#### Now test w/ regr.test
+surv.probs <- survfit(MFPCCox.fit, newdata=regr.test)
+MFPCCox.surv.probs <- survfit(MFPCCox.fit, newdata=regr.test)
+
+
+```
+
+``` {r MFPCCox_Grading, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+################################################################################################
+
+# surv.test
+
+thresholds_MFPCCox <- 
+  data.frame(cutoff     = seq(from=0.01,to=1,length.out=100),
+             #cutoff     = seq(from=0.86,to=0.88,length.out=100),
+            MSE         = array(0, 100),
+            forecasted  = array(NA,100),
+            CAUGHT_EARLY_n = array(NA,100),
+            avg.marg.early = array(NA,100),
+            avg.marg.late  = array(NA,100))
+
+opt_survprobs_MFPCCox = NA
+opt_survprobs_MFPCCox_MSE = 10000000000
+MFPCCox.surv.test <- surv.test
+
+for (i in 1:100){
+    # threshold <- 0.84 #--> This is the optimal threshold to minimize the MSE
+    # threshold <- 0.93
+
+    threshold = thresholds_MFPCCox$cutoff[i]
+    survProbsDF <-  surv.test %>%
+                    dplyr::select(PATIENT_ID, EVENT, t_REGMONTHS) %>%
+                    cbind(
+                        round(data.frame(
+                            t6 = t(summary(surv.probs, times=6)$surv),
+                            t12= t(summary(surv.probs, times=12)$surv),
+                            t18= t(summary(surv.probs, times=18)$surv),
+                            t24= t(summary(surv.probs, times=24)$surv),
+                            t30= t(summary(surv.probs, times=30)$surv),
+                            t36= t(summary(surv.probs, times=36)$surv),
+                            t42= t(summary(surv.probs, times=42)$surv),
+                            t48= t(summary(surv.probs, times=48)$surv),
+                            t54= rep(0.01,nrow(surv.test))
+                          ), 4) ) %>%
+                    filter(t_REGMONTHS>0 & EVENT==1) %>%
+                    mutate(E6  = case_when(t6   < threshold ~ 1, .default = 0),
+                           E12  = case_when(t12 < threshold ~ 1, .default = 0),
+                           E18  = case_when(t18 < threshold ~ 1, .default = 0),
+                           E24  = case_when(t24 < threshold ~ 1, .default = 0),
+                           E30  = case_when(t30 < threshold ~ 1, .default = 0),
+                           E36  = case_when(t36 < threshold ~ 1, .default = 0),
+                           E42  = case_when(t42 < threshold ~ 1, .default = 0),
+                           E48  = case_when(t48 < threshold ~ 1, .default = 0),
+                           t_REGMONTHS_PRED = case_when(t6  < threshold ~ 6,
+                                                        t12 < threshold ~ 12,
+                                                        t18 < threshold ~ 18,
+                                                        t24 < threshold ~ 24,
+                                                        t30 < threshold ~ 30,
+                                                        t36 < threshold ~ 36,
+                                                        t42 < threshold ~ 42,
+                                                        t48 < threshold ~ 48,
+                                                        t54 < threshold ~ 54)
+                           )
+
+    ### GET THE COUNT OF HOW MANY WERE CAUGHT EARLY
+    earlies <-
+      survProbsDF %>%
+      mutate(CATCH_CASE  = case_when(t_REGMONTHS_PRED==t_REGMONTHS ~ 1, .default=0), # This indicates a spot-on prediction
+             margin      = abs(t_REGMONTHS_PRED-t_REGMONTHS),
+             catch_early = t_REGMONTHS_PRED <= t_REGMONTHS) %>%  #What was the absolute margin of error?
+      group_by(catch_early) %>% summarise(n=n(), avg.marg=mean(margin), med.marg=median(margin))
+
+    ### GET THE MSE AND COUNT OF SUCCESSFULY FORECASTS
+    thresholds_MFPCCox$MSE[i]        <- mean( (survProbsDF$t_REGMONTHS - survProbsDF$t_REGMONTHS_PRED)**2, na.rm = TRUE)
+    thresholds_MFPCCox$forecasted[i] <- 100-sum(is.na(survProbsDF))
+
+    thresholds_MFPCCox$CAUGHT_EARLY_n[i] <- earlies %>% filter(catch_early==TRUE) %>% dplyr::select(n) %>% as.numeric()
+    thresholds_MFPCCox$avg.marg.early[i] <- earlies %>% 
+                                              filter(catch_early==TRUE) %>% 
+                                              dplyr::select(avg.marg) %>% as.numeric()
+    thresholds_MFPCCox$avg.marg.late[i]  <- earlies %>% 
+                                              filter(catch_early==TRUE) %>% 
+                                              dplyr::select(avg.marg) %>% 
+                                              as.numeric()
+
+############################################## RETAIN OPTIMAL SurvProbs matrix ###############
+    if (thresholds_MFPCCox$MSE[i] < opt_survprobs_MFPCCox_MSE){
+      opt_survprobs_MFPCCox <- survProbsDF
+      opt_survprobs_MFPCCox_MSE <- thresholds_MFPCCox$MSE[i]
+    }
+
+
+}
+
+# thresholds
+
+```
+
+``` {r much_plot_such_plot_wow, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+scale_factor = scale_factor <- 1 / 1250 
+################################## BASIC COX ##################################################################
+
+# Create a clean data frame
+plot_df          <- thresholds %>% 
+                    mutate( early_detection = CAUGHT_EARLY_n / max(thresholds$CAUGHT_EARLY_n, 
+                                                                   na.rm = TRUE) 
+                            )
+base_cox_optimal <- plot_df[which.min(plot_df$MSE),]
+
+# scale_factor     <- max(plot_df$early_detection, na.rm=TRUE) / max(plot_df$MSE, na.rm=TRUE)
+
+coxplot <- ggplot(plot_df, aes(x = cutoff)) +
+    geom_line(aes(y = early_detection, color = "Early Detection Rate"), size = 0.5) +      # Add detection rate
+    geom_line(aes(y = MSE * scale_factor, color = "MSE"), size = 0.5) +                    # add MSE on second axis
+    geom_vline(aes(xintercept = base_cox_optimal$cutoff,                                    # MSE-optimal threshold
+               color = "MSE-optimal Threshold"), linetype='twodash', size = 0.75) + 
+    geom_vline(aes(xintercept = 0.94,                                                        # diagnostic-optimal
+               color = "Diagnostic-optimal Threshold"), linetype='twodash', size = 0.75) + 
+    scale_y_continuous( name = "Early Detection Rate",                                   # Axis labels
+                        sec.axis = sec_axis(~ . / scale_factor, name = "MSE"))+
+    scale_color_manual( name = "",                                                       # Line colors legend
+                        values = c( "Early Detection Rate" = "maroon", 
+                                    "MSE" = "cyan4", 
+                                    "MSE-optimal Threshold"="darkolivegreen",
+                                    "Diagnostic-optimal Threshold" = 'blue')) +
+  
+    labs(title = "Basic Cox Model" ) +                                  # axis labels
+    theme_minimal() +
+    theme( legend.position = "bottom", plot.title = element_text(size = 12) )
+
+################################## BASIC RSF ##################################################################
+
+# Create a clean data frame
+plot_df          <- thresholds_RSF %>% 
+                mutate( early_detection = CAUGHT_EARLY_n / max(thresholds_RSF$CAUGHT_EARLY_n, na.rm = TRUE) )
+RSF_optimal      <- plot_df[which.min(plot_df$MSE),]
+# scale_factor     <- max(plot_df$early_detection, na.rm=TRUE) / max(plot_df$MSE, na.rm=TRUE)
+
+RSFplot <- ggplot(plot_df, aes(x = cutoff)) +
+    geom_line(aes(y = early_detection, color = "Early Detection Rate"), size = 0.5) +      # Add detection rate
+    geom_line(aes(y = MSE * scale_factor, color = "MSE"), size = 0.5) +                    # add MSE on second axis
+    geom_vline(aes(xintercept = RSF_optimal$cutoff,                                    # MSE-optimal threshold
+               color = "MSE-optimal Threshold"), linetype='twodash', size = 0.75) + 
+    geom_vline(aes(xintercept = 0.84,                                                        # diagnostic-optimal
+               color = "Diagnostic-optimal Threshold"), linetype='twodash', size = 0.75) + 
+    # scale_y_continuous( name = "Early Detection Rate",                                   # Axis labels
+    #                     sec.axis = sec_axis(~ . / scale_factor, name = "MSE"))+
+    scale_y_continuous(
+      name = "Early Detection Rate",
+      limits = c(0, 1),
+      sec.axis = sec_axis(~ . / scale_factor, name = "MSE", breaks = seq(0, 1250, by = 250))
+    ) +
+  
+    scale_color_manual( name = "",                                                       # Line colors legend
+                        values = c( "Early Detection Rate" = "maroon", 
+                                    "MSE" = "cyan4", 
+                                    "MSE-optimal Threshold"="darkolivegreen",
+                                    "Diagnostic-optimal Threshold" = 'blue')) +
+  
+    labs( title = "Basic RSF Model" ) +                                  # axis labels
+    theme_minimal() +
+    theme( legend.position = "bottom", plot.title = element_text(size = 12) )
+
+################################## MFPCA RSF ##################################################################
+# RSF_MFPCA_optimal <- thresholds_RSF_MFPCA[which.min(thresholds_RSF_MFPCA$MSE),]
+
+# Create a clean data frame
+plot_df          <- thresholds_RSF_MFPCA %>% 
+                    mutate( 
+                      early_detection = CAUGHT_EARLY_n / max(thresholds_RSF_MFPCA$CAUGHT_EARLY_n,
+                                                              na.rm=TRUE) 
+                      )
+RSF_MFPCA_optimal<- plot_df[which.min(plot_df$MSE),]
+# scale_factor     <- max(plot_df$early_detection, na.rm=TRUE) / max(plot_df$MSE, na.rm=TRUE)
+
+MFPCA.RSFplot <- ggplot(plot_df, aes(x = cutoff)) +
+    geom_line(aes(y = early_detection, color = "Early Detection Rate"), size = 0.5) +    # Add detection rate
+    geom_line(aes(y = MSE * scale_factor, color = "MSE"), size = 0.5) +                  # add MSE on second axis
+    geom_vline(aes(xintercept = RSF_MFPCA_optimal$cutoff,                                    # MSE-optimal threshold
+               color = "MSE-optimal Threshold"), linetype='twodash', size = 0.75) + 
+    geom_vline(aes(xintercept = 0.9,                                                        # diagnostic-optimal
+               color = "Diagnostic-optimal Threshold"), linetype='twodash', size = 0.75) + 
+    scale_y_continuous( name = "Early Detection Rate",                                   # Axis labels
+                        sec.axis = sec_axis(~ . / scale_factor, name = "MSE"))+
+    scale_color_manual( name = "",                                                       # Line colors legend
+                        values = c( "Early Detection Rate" = "maroon", 
+                                    "MSE" = "cyan4", 
+                                    "MSE-optimal Threshold"="darkolivegreen",
+                                    "Diagnostic-optimal Threshold" = 'blue')) +
+  
+    labs(x = "Threshold", title = "MFPCA-RSF Model" ) +                                  # axis labels
+    theme_minimal() +
+    theme( legend.position = "bottom", plot.title = element_text(size = 12) )
+
+
+################################## MFPCCox ##################################################################
+# RSF_MFPCA_optimal <- thresholds_RSF_MFPCA[which.min(thresholds_RSF_MFPCA$MSE),]
+
+# Create a clean data frame
+plot_df          <- thresholds_MFPCCox %>% 
+                    mutate( 
+                      early_detection = CAUGHT_EARLY_n / max(thresholds_MFPCCox$CAUGHT_EARLY_n,na.rm=TRUE) 
+                      )
+MFPCCox_optimal<- plot_df[which.min(plot_df$MSE),]
+# scale_factor     <- max(plot_df$early_detection, na.rm=TRUE) / max(plot_df$MSE, na.rm=TRUE)
+
+MFPCA.coxplot <- ggplot(plot_df, aes(x = cutoff)) +
+    geom_line(aes(y = early_detection, color = "Early Detection Rate"), size = 0.5) +    # Add detection rate
+    geom_line(aes(y = MSE * scale_factor, color = "MSE"), size = 0.5) +                  # add MSE on second axis
+    geom_vline(aes(xintercept = MFPCCox_optimal$cutoff,                                    # MSE-optimal threshold
+               color = "MSE-optimal Threshold"), linetype='twodash', size = 0.75) + 
+    geom_vline(aes(xintercept = 0.96,                                                        # diagnostic-optimal
+               color = "Diagnostic-optimal Threshold") , linetype='twodash', size = 0.75) + 
+    scale_y_continuous( name = "Early Detection Rate",                                   # Axis labels
+                        sec.axis = sec_axis(~ . / scale_factor, name = "MSE"))+
+    scale_color_manual( name = "",                                                       # Line colors legend
+                        values = c( "Early Detection Rate" = "maroon", 
+                                    "MSE" = "cyan4", 
+                                    "MSE-optimal Threshold"="darkolivegreen",
+                                    "Diagnostic-optimal Threshold" = 'blue')) +
+  
+    labs(x = "Threshold", title = "MFPCCox Model" ) +                                  # axis labels
+    theme_minimal() +
+    theme( legend.position = "bottom", plot.title = element_text(size = 12) )
+
+```
+
+```{r ModCIndex_MSE, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+
+########################### BASIC COX MODEL #################################################
+cox_cutoff    <- thresholds[which.min(thresholds$MSE),]$cutoff
+# cox.surv.probs
+
+
+survProbsDF <-  surv.test %>%
+                    dplyr::select(PATIENT_ID, EVENT, t_REGMONTHS) %>%
+                    cbind(
+                        round(data.frame(
+                            t6 = t(summary(surv.probs, times=6)$surv),
+                            t12= t(summary(surv.probs, times=12)$surv),
+                            t18= t(summary(surv.probs, times=18)$surv),
+                            t24= t(summary(surv.probs, times=24)$surv),
+                            t30= t(summary(surv.probs, times=30)$surv),
+                            t36= t(summary(surv.probs, times=36)$surv),
+                            t42= t(summary(surv.probs, times=42)$surv),
+                            t48= t(summary(surv.probs, times=48)$surv),
+                            t54= rep(0.01,nrow(surv.test)   ), 4) ) 
+                        ) %>%
+                    filter(t_REGMONTHS>0) %>%
+                    mutate(E6   = as.numeric(t6  < cox_cutoff), E12  = as.numeric(t12 < cox_cutoff),
+                           E18  = as.numeric(t18 < cox_cutoff), E24  = as.numeric(t24 < cox_cutoff),
+                           E30  = as.numeric(t30 < cox_cutoff), E36  = as.numeric(t36 < cox_cutoff),
+                           E42  = as.numeric(t42 < cox_cutoff), E48  = as.numeric(t48 < cox_cutoff),
+                           t_REGMONTHS_PRED = case_when(t6  < cox_cutoff ~ 6,  t12 < cox_cutoff ~ 12,
+                                                        t18 < cox_cutoff ~ 18, t24 < cox_cutoff ~ 24,
+                                                        t30 < cox_cutoff ~ 30, t36 < cox_cutoff ~ 36,
+                                                        t42 < cox_cutoff ~ 42, t48 < cox_cutoff ~ 48,
+                                                        t54 < cox_cutoff ~ 54),
+                           early_catch = as.numeric(t_REGMONTHS >= t_REGMONTHS_PRED)
+                           )
+
+Cox_C_index = sum(survProbsDF$early_catch)/nrow(survProbsDF)
+
+########################### BASIC RSF MODEL #################################################
+RSF_cutoff       <- thresholds_RSF[which.min(thresholds_RSF$MSE),]$cutoff
+
+# RSF.surv.probs
+
+survProbsRSF_DF <-  survProbsRSF %>% 
+                    filter(t_REGMONTHS>0) %>%
+                    mutate( E6   = as.numeric(t6 < RSF_cutoff),
+                            E12  = as.numeric(t12 < RSF_cutoff),
+                            E18  = as.numeric(t18 < RSF_cutoff),
+                            E24  = as.numeric(t24 < RSF_cutoff),
+                            E30  = as.numeric(t30 < RSF_cutoff),
+                            E36  = as.numeric(t36 < RSF_cutoff),
+                            E42  = as.numeric(t42 < RSF_cutoff),
+                            E48  = as.numeric(t48 < RSF_cutoff),
+                            t_REGMONTHS_PRED = 
+                              case_when(t6  < RSF_cutoff ~ 6,  t12 < RSF_cutoff ~ 12, 
+                                        t18 < RSF_cutoff ~ 18, t24 < RSF_cutoff ~ 24, 
+                                        t30 < RSF_cutoff ~ 30, t36 < RSF_cutoff ~ 36,
+                                        t42 < RSF_cutoff ~ 42, t48 < RSF_cutoff ~ 48,
+                                        .default = 54),
+                            early_catch = as.numeric(t_REGMONTHS >= t_REGMONTHS_PRED))
+
+RSF_C_index = sum(survProbsRSF_DF$early_catch)/nrow(survProbsRSF_DF)
+
+
+########################### MFPCCox MODEL #################################################
+MFPCCox_cutoff   <- thresholds_MFPCCox[which.min(thresholds_MFPCCox$MSE),]$cutoff
+# cox.surv.probs
+
+
+survProbsDF_MFPCCox <-  MFPCCox.surv.test %>%
+                    dplyr::select(PATIENT_ID, EVENT, t_REGMONTHS) %>%
+                    cbind(
+                        round(data.frame(
+                            t6 = t(summary(MFPCCox.surv.probs, times=6)$surv),
+                            t12= t(summary(MFPCCox.surv.probs, times=12)$surv),
+                            t18= t(summary(MFPCCox.surv.probs, times=18)$surv),
+                            t24= t(summary(MFPCCox.surv.probs, times=24)$surv),
+                            t30= t(summary(MFPCCox.surv.probs, times=30)$surv),
+                            t36= t(summary(MFPCCox.surv.probs, times=36)$surv),
+                            t42= t(summary(MFPCCox.surv.probs, times=42)$surv),
+                            t48= t(summary(MFPCCox.surv.probs, times=48)$surv),
+                            t54= rep(0.01, nrow(surv.test))
+                          ), 4) ) %>%
+                    filter(t_REGMONTHS>0 ) %>%
+                    mutate(E6  =  as.numeric(t6  < MFPCCox_cutoff),
+                           E12  = as.numeric(t12 < MFPCCox_cutoff),
+                           E18  = as.numeric(t18 < MFPCCox_cutoff),
+                           E24  = as.numeric(t24 < MFPCCox_cutoff),
+                           E30  = as.numeric(t30 < MFPCCox_cutoff),
+                           E36  = as.numeric(t36 < MFPCCox_cutoff),
+                           E42  = as.numeric(t42 < MFPCCox_cutoff),
+                           E48  = as.numeric(t48 < MFPCCox_cutoff),
+                           t_REGMONTHS_PRED = case_when(
+                             t6  < MFPCCox_cutoff ~ 6, t12 < MFPCCox_cutoff ~ 12,
+                             t18 < MFPCCox_cutoff ~ 18,t24 < MFPCCox_cutoff ~ 24,
+                             t30 < MFPCCox_cutoff ~ 30,t36 < MFPCCox_cutoff ~ 36,
+                             t42 < MFPCCox_cutoff ~ 42,t48 < MFPCCox_cutoff ~ 48,
+                             t54 < MFPCCox_cutoff ~ 54),
+                            early_catch = as.numeric(t_REGMONTHS >= t_REGMONTHS_PRED) )
+
+MFPCCox_C_index = sum(survProbsDF_MFPCCox$early_catch)/nrow(survProbsDF_MFPCCox)
+
+########################### MFPCA-RSF MODEL #################################################
+RSF_MFPCA_cutoff <- thresholds_RSF_MFPCA[which.min(thresholds_RSF_MFPCA$MSE),]$cutoff
+
+### 2. Create cutoff thresholds
+threshold = RSF_MFPCA_cutoff
+survProbsDF <- survProbsRSF
+
+survProbsRSF_DF <-  survProbsRSF %>% 
+                    filter(t_REGMONTHS>0 & EVENT==1) %>%
+                    mutate( E6   = as.numeric(t6   < threshold), E12  = as.numeric(t12 < threshold),
+                            E18  = as.numeric(t18 < threshold),  E24  = as.numeric(t24 < threshold),
+                            E30  = as.numeric(t30 < threshold),  E36  = as.numeric(t36 < threshold),
+                            E42  = as.numeric(t42 < threshold),  E48  = as.numeric(t48 < threshold),
+                            t_REGMONTHS_PRED = case_when(t6  < threshold ~ 6,  t12 < threshold ~ 12,
+                                                         t18 < threshold ~ 18, t24 < threshold ~ 24,
+                                                         t30 < threshold ~ 30, t36 < threshold ~ 36,
+                                                         t42 < threshold ~ 42, t48 < threshold ~ 48,
+                                                         .default = 54), #Impose an upper bound. May delete.
+                            early_catch = as.numeric(t_REGMONTHS >= t_REGMONTHS_PRED) 
+                            )
+
+MFPCRSF_C_index = sum(survProbsRSF_DF$early_catch)/nrow(survProbsRSF_DF)
+
+```
+
+```{r ModCIndex_DIAG, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+
+########################### BASIC COX MODEL #################################################
+cox_cutoff    <- 0.95
+# cox.surv.probs
+
+
+survProbsDF <-  surv.test %>%
+                    dplyr::select(PATIENT_ID, EVENT, t_REGMONTHS) %>%
+                    cbind(
+                        round(data.frame(
+                            t6 = t(summary(surv.probs, times=6)$surv),
+                            t12= t(summary(surv.probs, times=12)$surv),
+                            t18= t(summary(surv.probs, times=18)$surv),
+                            t24= t(summary(surv.probs, times=24)$surv),
+                            t30= t(summary(surv.probs, times=30)$surv),
+                            t36= t(summary(surv.probs, times=36)$surv),
+                            t42= t(summary(surv.probs, times=42)$surv),
+                            t48= t(summary(surv.probs, times=48)$surv),
+                            t54= rep(0.01,nrow(surv.test)   ), 4) ) 
+                        ) %>%
+                    filter(t_REGMONTHS>0) %>%
+                    mutate(E6   = as.numeric(t6  < cox_cutoff), E12  = as.numeric(t12 < cox_cutoff),
+                           E18  = as.numeric(t18 < cox_cutoff), E24  = as.numeric(t24 < cox_cutoff),
+                           E30  = as.numeric(t30 < cox_cutoff), E36  = as.numeric(t36 < cox_cutoff),
+                           E42  = as.numeric(t42 < cox_cutoff), E48  = as.numeric(t48 < cox_cutoff),
+                           t_REGMONTHS_PRED = case_when(t6  < cox_cutoff ~ 6,  t12 < cox_cutoff ~ 12,
+                                                        t18 < cox_cutoff ~ 18, t24 < cox_cutoff ~ 24,
+                                                        t30 < cox_cutoff ~ 30, t36 < cox_cutoff ~ 36,
+                                                        t42 < cox_cutoff ~ 42, t48 < cox_cutoff ~ 48,
+                                                        t54 < cox_cutoff ~ 54),
+                           early_catch = as.numeric(t_REGMONTHS >= t_REGMONTHS_PRED)
+                           )
+
+Cox_C_index_DIAG = sum(survProbsDF$early_catch)/nrow(survProbsDF)
+
+########################### BASIC RSF MODEL #################################################
+RSF_cutoff       <- 0.91
+
+# RSF.surv.probs
+
+survProbsRSF_DF <-  survProbsRSF %>% 
+                    filter(t_REGMONTHS>0) %>%
+                    mutate( E6   = as.numeric(t6 < RSF_cutoff),
+                            E12  = as.numeric(t12 < RSF_cutoff),
+                            E18  = as.numeric(t18 < RSF_cutoff),
+                            E24  = as.numeric(t24 < RSF_cutoff),
+                            E30  = as.numeric(t30 < RSF_cutoff),
+                            E36  = as.numeric(t36 < RSF_cutoff),
+                            E42  = as.numeric(t42 < RSF_cutoff),
+                            E48  = as.numeric(t48 < RSF_cutoff),
+                            t_REGMONTHS_PRED = 
+                              case_when(t6  < RSF_cutoff ~ 6,  t12 < RSF_cutoff ~ 12, 
+                                        t18 < RSF_cutoff ~ 18, t24 < RSF_cutoff ~ 24, 
+                                        t30 < RSF_cutoff ~ 30, t36 < RSF_cutoff ~ 36,
+                                        t42 < RSF_cutoff ~ 42, t48 < RSF_cutoff ~ 48,
+                                        .default = 54),
+                            early_catch = as.numeric(t_REGMONTHS >= t_REGMONTHS_PRED))
+
+RSF_C_index_DIAG = sum(survProbsRSF_DF$early_catch)/nrow(survProbsRSF_DF)
+
+
+########################### MFPCCox MODEL #################################################
+MFPCCox_cutoff   <- 0.95
+# cox.surv.probs
+
+survProbsDF_MFPCCox <-  MFPCCox.surv.test %>%
+                    dplyr::select(PATIENT_ID, EVENT, t_REGMONTHS) %>%
+                    cbind(
+                        round(data.frame(
+                            t6 = t(summary(MFPCCox.surv.probs, times=6)$surv),
+                            t12= t(summary(MFPCCox.surv.probs, times=12)$surv),
+                            t18= t(summary(MFPCCox.surv.probs, times=18)$surv),
+                            t24= t(summary(MFPCCox.surv.probs, times=24)$surv),
+                            t30= t(summary(MFPCCox.surv.probs, times=30)$surv),
+                            t36= t(summary(MFPCCox.surv.probs, times=36)$surv),
+                            t42= t(summary(MFPCCox.surv.probs, times=42)$surv),
+                            t48= t(summary(MFPCCox.surv.probs, times=48)$surv),
+                            t54= rep(0.01, nrow(surv.test))
+                          ), 4) ) %>%
+                    filter(t_REGMONTHS>0 ) %>%
+                    mutate(E6  =  as.numeric(t6  < MFPCCox_cutoff),
+                           E12  = as.numeric(t12 < MFPCCox_cutoff),
+                           E18  = as.numeric(t18 < MFPCCox_cutoff),
+                           E24  = as.numeric(t24 < MFPCCox_cutoff),
+                           E30  = as.numeric(t30 < MFPCCox_cutoff),
+                           E36  = as.numeric(t36 < MFPCCox_cutoff),
+                           E42  = as.numeric(t42 < MFPCCox_cutoff),
+                           E48  = as.numeric(t48 < MFPCCox_cutoff),
+                           t_REGMONTHS_PRED = case_when(
+                             t6  < MFPCCox_cutoff ~ 6, t12 < MFPCCox_cutoff ~ 12,
+                             t18 < MFPCCox_cutoff ~ 18,t24 < MFPCCox_cutoff ~ 24,
+                             t30 < MFPCCox_cutoff ~ 30,t36 < MFPCCox_cutoff ~ 36,
+                             t42 < MFPCCox_cutoff ~ 42,t48 < MFPCCox_cutoff ~ 48,
+                             t54 < MFPCCox_cutoff ~ 54),
+                            early_catch = as.numeric(t_REGMONTHS >= t_REGMONTHS_PRED) )
+
+MFPCCox_C_index_DIAG = sum(survProbsDF_MFPCCox$early_catch)/nrow(survProbsDF_MFPCCox)
+
+########################### MFPCA-RSF MODEL #################################################
+RSF_MFPCA_cutoff <- 0.96
+
+### 2. Create cutoff thresholds
+threshold = RSF_MFPCA_cutoff
+survProbsDF <- survProbsRSF
+
+survProbsRSF_DF <-  survProbsRSF %>% 
+                    filter(t_REGMONTHS>0 & EVENT==1) %>%
+                    mutate( E6   = as.numeric(t6   < threshold), E12  = as.numeric(t12 < threshold),
+                            E18  = as.numeric(t18 < threshold),  E24  = as.numeric(t24 < threshold),
+                            E30  = as.numeric(t30 < threshold),  E36  = as.numeric(t36 < threshold),
+                            E42  = as.numeric(t42 < threshold),  E48  = as.numeric(t48 < threshold),
+                            t_REGMONTHS_PRED = case_when(t6  < threshold ~ 6,  t12 < threshold ~ 12,
+                                                         t18 < threshold ~ 18, t24 < threshold ~ 24,
+                                                         t30 < threshold ~ 30, t36 < threshold ~ 36,
+                                                         t42 < threshold ~ 42, t48 < threshold ~ 48,
+                                                         .default = 54), #Impose an upper bound. May delete.
+                            early_catch = as.numeric(t_REGMONTHS >= t_REGMONTHS_PRED) 
+                            )
+
+MFPCRSF_C_index_DIAG = sum(survProbsRSF_DF$early_catch)/nrow(survProbsRSF_DF)
+```
+
+```{r metrics, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+################ CREATE THE BASELINE metrics DATA FRAME
+
+metrics <- data.frame(
+  model = c('Cox (MSE)', 'RSF (MSE)', 'MFPCCox (MSE)', 'RSF-MFPCA (MSE)',
+          'Cox (Diag)', 'RSF (Diag)', 'MFPCCox (Diag)', 'RSF-MFPCA (Diag)'),
+  rbind(base_cox_optimal, RSF_optimal, MFPCCox_optimal, RSF_MFPCA_optimal) %>% 
+  select(-early_detection) %>%
+  rbind( thresholds[95,], thresholds_RSF[91,], thresholds_MFPCCox[95,], thresholds_RSF_MFPCA[96,] ) 
+)
+
+################ ADD THE C-INDEX SCORES
+metrics$C.Index = round(
+                 c(Cox_C_index, RSF_C_index, MFPCCox_C_index, MFPCRSF_C_index,
+                   Cox_C_index_DIAG, RSF_C_index_DIAG, MFPCCox_C_index_DIAG, MFPCRSF_C_index_DIAG),
+                 3)
+
+################ REMOVING EXTRA COLUMNS AND REFORMATTING
+metrics <-  metrics %>% 
+            mutate( early_detection = CAUGHT_EARLY_n / max(thresholds$CAUGHT_EARLY_n, na.rm = TRUE),
+                    margin          = round(avg.marg.early, 3)
+                    ) %>%
+            select(-c(forecasted, avg.marg.early, avg.marg.late))
+
+```
+
+```{r VIMP_plots, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+### Create the VIMP plots
+vimp_rsf_basic_values <- tibble::rownames_to_column(as.data.frame(RF_fit_new$importance)) %>%
+                          rename('Variable'=1, 'Importance'=2)
+
+vimp_rsf_MFPCA_values <- tibble::rownames_to_column(as.data.frame(RSF_MFPCA$importance)) %>%
+                         rename('Variable'=1, 'Importance'=2)
+
+
+### create the basic RSF model's VIMP plot
+basic_VIMP_plot <-
+  ggplot(data=vimp_rsf_basic_values,
+       aes(x=reorder(Variable, Importance),
+           y=Importance)) +
+  geom_bar(stat='Identity') +
+  coord_flip() + 
+  labs(title = "VIMP Plot - Basic RSF", xlab ) +
+  ylab('Variable')
+
+### create the basic RSF model's VIMP plot
+MFPCA_VIMP_plot <-
+  ggplot(data=vimp_rsf_MFPCA_values,
+       aes(x=reorder(Variable, Importance),
+           y=Importance)) +
+  geom_bar(stat='Identity') +
+  coord_flip() + 
+  labs(title = "VIMP Plot - MFPCA-Augmented RSF", xlab ) +
+  ylab('Variable')
+
+# grid.arrange(basic_VIMP_plot, MFPCA_VIMP_plot, nrow = 1, ncol = 2) 
+
+
+```
+
+```{r RSF_error_rates, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE, fig.height=3}
+
+### CREATE THE DATA FRAME
+TreeErrorRates = data.frame(
+  treeCount = seq(1,400,by=1),
+  basic_error_rate = RF_fit_new$err.rate,
+  MFPCA_RSF_error_rate = RSF_MFPCA$err.rate
+) %>% na.omit(.)
+
+### PLOT THE ERROR RATES TOGETHER ON THE SAME PLOT
+combined_error_rate_plot <- 
+  ggplot(data=TreeErrorRates,
+        aes(x = treeCount, name='Error Rate')) +
+  geom_line(aes(y=basic_error_rate, color='Basic RSF Model')) +
+  geom_line(aes(y=MFPCA_RSF_error_rate, color='MFPCA-Augmented RSF Model')) +
+  scale_color_manual("",
+                     breaks = c('Basic RSF Model',
+                                'MFPCA-Augmented RSF Model'),
+                     values = c('cyan4', 'maroon')) +
+
+
+  labs(title = "Error Rate Convergence" ) +   # axis labels
+    xlab('Tree Count') +
+    ylab('Error Rate')
+
+### PLOT THE BASIC MODEL'S ERROR RATE
+RSF_basic_error_rate_plot <- 
+  ggplot(data=TreeErrorRates,
+        aes(x = treeCount, name='Error Rate')) +
+  geom_line(aes(y=basic_error_rate, color='maroon')) +
+  labs(title = "Error Rate Convergence" ) +   # axis labels
+    xlab('Tree Count') +
+    ylab('Error Rate') + 
+    ylim(c(0.18,0.285)) + 
+    theme(legend.position = 'none')
+
+### PLOT THE AUGMENTED MODEL'S ERROR RATE
+RSF_MFPCA_error_rate_plot <- 
+  ggplot(data=TreeErrorRates,
+        aes(x = treeCount, name='Error Rate')) +
+  geom_line(aes(y=MFPCA_RSF_error_rate, color='cyan4')) +
+  labs(title = "Error Rate Convergence" ) +   # axis labels
+    xlab('Tree Count') +
+    ylab('Error Rate') + 
+    ylim(c(0.18,0.285)) + 
+    theme(legend.position = 'none')
+
+    
+```
+
+
+\raggedright
+\small
+
+## Abstract \
+
+With the development of new neurocognitive assessments for tracking the progression of Alzheimer's disease (AD), we are provided with opportunities to forecast the timeline for an AD diagnosis at the time of an earlier stage in the diagnostic process for AD. In this paper, we examine potential predictors for use in modeling AD progression, then propose a novel method for early-phase AD progression, which iterates on the work of Li and Luo\textsuperscript{1} in their development of the MFPCCox method. Application to the Alzheimer's Disease Neuroimaging Initiative (ADNI) dataset is used to contrast and demonstrate the predictive power of these models.
+
+**Key words:** Cox Regression, Random Survival Forest, Multivariate longitudinal data, Neuroimaging, MFPCA, Alzheimer's Disease, Mild Cognitive Impairment
+
+
+## 1. Introduction
+
+### 1.1 Alzheimer's Disease and ADNI \
+
+Alzheimer's disease (AD) is a progressive form of dementia, characterized by memory loss and declines in other forms of cognitive function such as conversational capability and appropriate environmental stimulus response. Alzheimer's generally begins by affecting the portion of the brain that affects learning, then develops into greater expressions of disorientation; mood and behavioral changes; deepening confusion about events, time, and place; and eventually difficulty speaking, swallowing, and walking.\textsuperscript{2}
+
+The progression of Alzheimer's disease begins at an asymptomatic state, and then the first diagnostic phase is mild cognitive impairment (MCI), where the individual maintains the ability to independently perform most activities of daily living; finally, after cognitive impairment begins to substantially interfere with daily activities, a diagnosis of Alzheimer's disease is made after one or more neurological assessments. Some of these assessments include:
+
+1. Rey Auditory Verbal Learning Test (RAVLT): 
+  An assessment of immediate memory and verbal learning, based on a series of lists of words, with different recall exercises yielding different scores. These include the RAVLT-learning and RAVLT-immediate scores.\textsuperscript{3}
+  
+2. Functional Activities Questionnaire (FAQ):
+  A questionnaire regarding an individual's instrumental activities of daily living, including managing personal finances and preparing meals.\textsuperscript{4}
+  
+3. Mini Mental State Examination (MMSE):
+  An 11-question short test of general cognitive function, intended as a quick screening tool.\textsuperscript{5}
+  
+4. Alzheimer's Disease Assessment Scale-Cognitive Subscale (ADAS-COG):
+  The ADAS-COG is a family of task-based assessments used as a more detailed diagnostic tool for assessing the severity of cognitive decline in dementia.\textsuperscript{6}
+
+The ADNI study is a long-term data collection initiative that has been collecting biospecimen, neuroimaging, and biomarker data to track and model AD progression in a series of phases, beginning in 2004 and continuing to current day\textsuperscript{7}. The ADNI-1 phase, where the data used in this study is sourced from, was conducted between 2004 and 2008, following approximately 800 patients through their MCI/AD progression. Subsequent phases of the study focused on biomarkers in early phases of AD, as well as the use of Tau PET imaging and other functional imaging techniques in clinical trials. The RAVLT, MMSE, FAQ, and ADAS-COG-13 assessments were all included in the panel of neurocognitive assessments that were collected as part of the ADNI-1 protocol.
+
+This paper is organized as follows. In the remainder of Section 1, we discuss necessary terminology in basic survival analysis and illustrate the progression from the most basic models to the multivariate models in Section 3.  In section 2, we illustrate the exploratory data analysis and preparation included in this study. section 3, we discuss the predictive performance of the common multivariate models included in this study, the cox regression and the random survival forest. In Section 4, we discuss the progression from cox regression and random survival forests to MFPCCox and our new MFPCA-augmented RSF model, as well as the predictive power of each model. In section 5, we discuss the results and make some final remarks.
+
+
+### 1.2 Survival Analysis  \
+
+Survival analysis is characterized by a specific type of data, and a few common analysis goals; the data is time-to-event data that often features right-censoring. The censoring occurs when individual subjects exit the study group prior to the event of interest taking place in their case, and while left-censoring and interval censoring can also take place, these are generally uncommon in survival analysis and are not present in the ADNI-1 data set. The goal of survival analysis is almost always to predict time-to-event, but can sometimes be splintered into a classification goal where the subjects are classified into whether or not they will experience an event within a given time frame. Several core concepts in survival analysis include:
+
+  1. The Hazard function ${h}(t)$ gives the instantaneous probability that a subject will experience an event at time $t$,.
+
+  2. The Survival function ${S}(t)$ gives the probability that a subject will not have experienced the event by time $t$:
+  
+  $$ \begin{aligned}
+  \mathrm{S}(t) = {P}(T > t) = 1-{F}(t)
+  \end{aligned} $$
+
+
+Survival analysis methods must be able to account for censored subjects, and several of the most common methods of survival analysis are Kaplan-Meier estimation, Cox regression, and random survival forests. The Kaplan-Meier estimator is the most basic survival analysis method; it is a nonparametric method calculated as the product of the survival probabilities for all times where an event occurred up to time $t$. With $d_t$ indicating the number of events experienced at time $t$ and $n_t$ indicating the number of individuals who have not experienced an event prior to time $t$, this is given by:
+  
+  $$ \hat{S}(t) = \prod_{i: t_i < t} (1-d_i/n_i)$$
+The primary use of the Kaplan-Meier estimator is as an exploratory data analysis tool for visualizing the estimated survival function, with a characteristic stair step shape based on the time points where events occur. The Kaplan-Meier estimator can also be used as a graphical tool for determining whether there is a reasonable effect on the survival function between the levels of a categorical predictor.
+
+```{r kaplanMeierPlot, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE, fig.height=3}
+
+km_fit        <- survfit(Surv(t_REGMONTHS, EVENT)~1, data=surv)
+km_gender_fit <- survfit(Surv(t_REGMONTHS, EVENT)~GENDER, data=surv)
+
+km_plot = autoplot(km_fit,
+                   ylab = 'Survival') + 
+  theme( legend.position = "bottom", plot.title = element_text(size = 12) )
+km_gender_plot = autoplot(km_gender_fit,
+                          ylab = 'Survival',
+                          legend=) + 
+  theme( legend.position = "bottom", plot.title = element_text(size = 12) )
+
+grid.arrange(km_plot, km_gender_plot, nrow = 1, ncol = 2) 
+
+
+```
+  
+The Kaplan-Meier estimator has substantial drawbacks, as it includes no ability to incorporate predictor variables into the prediction; it is simply a function of time. For multivariate survival analysis and inference, one of the most commonly used methods is the Cox proportional hazards regression, where the hazard rate is the outcome variable.
+
+### 1.3 Data Treatment
+
+The ADNI-1 data set includes a significant degree of missingness across many of these variables, which ranged from 3% to above 50% for some vairables, with missingness increasing at later time horizons. This missingness precluded the use of some variables with large amounts of missing data, such as the concentrations of extracellular amyloid beta peptides (ABETA) and phosphorylated Tau protein (PTAU) in the patient's cerebrospinal fluid, which have showed potential as a predictor in prior studies\textsuperscript{8,9}.
+
+
+``` {r missingness1, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE, fig.height=5.5}
+
+missing_test_dataset <- adni1_source %>% 
+        mutate(   PATIENT_ID = PTID,
+                  # COG13        = ADAS13,
+                  EDU_YEARS    = PTEDUCAT,
+                  GENDER       = PTGENDER,
+                  AD_STATUS    = CONV_FLAG,
+                  t_MONTHS     = t_months,
+                  EVENT        = case_when(DX=='Dementia' ~ 1, .default=0),
+                  APOE_PRESENT = case_when(APOE4 > 0 ~ 1, .default=0),
+                  COG13        = ADAS13
+                  ) %>%
+        filter( #t_REGMONTHS <= 42 & 
+                  LAST_OBS == 1) %>%
+        dplyr::select( RAVLT_immediate, RAVLT_immediate_bl,
+                       RAVLT_learning,  RAVLT_learning_bl,
+                       RAVLT_forgetting,RAVLT_forgetting_bl,
+                       RAVLT_perc_forgetting,                       RAVLT_perc_forgetting_bl, 
+                       FAQ,    FAQ_bl, 
+                       ADAS13, ADAS13_bl,
+                       MMSE,   MMSE_bl,
+                       ADASQ4, ADASQ4_bl, 
+                       ADAS11, ADAS11_bl,
+                       FDG)
+
+vis_miss(missing_test_dataset) + ggtitle('Missing Values for Neurocognitive Assessme')
+
+```
+
+``` {r missingness2, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE, fig.height=5.5}
+
+missing_test_dataset <- adni1_source %>% 
+        mutate(   PATIENT_ID = PTID,
+                  # COG13        = ADAS13,
+                  EDU_YEARS    = PTEDUCAT,
+                  GENDER       = PTGENDER,
+                  AD_STATUS    = CONV_FLAG,
+                  t_MONTHS     = t_months,
+                  EVENT        = case_when(DX=='Dementia' ~ 1, .default=0),
+                  APOE_PRESENT = case_when(APOE4 > 0 ~ 1, .default=0),
+                  COG13        = ADAS13
+                  ) %>%
+        filter( #t_REGMONTHS <= 42 & 
+                  LAST_OBS == 1) %>%
+        dplyr::select(Hippocampus_bl, WholeBrain_bl, 
+                      APOE_PRESENT, TAU, PTAU, 
+                      Entorhinal, Fusiform, MidTemp, ICV, CDRSB_bl,
+                      PIB, AV45, FBB, ABETA)
+
+vis_miss(missing_test_dataset) + ggtitle('Missing Values for Biomarkers')
+```
+
+In this study, principle analysis by conditional estimation (PACE) was used to aid both the convergence of MFPCA computation over the longitudinal training data, and median imputation was used to mitigate potential bias and improve the predictive power of the model. This will tend to reduce overall variance and potentially predictive power, but this has the secondary goal of reducing the effects of nonstandard variances in the regressions used to estimate the components for test data.
+
+## 2. Foundation Models
+
+### 2.1 Standard Cox Proportional Hazards Model \
+
+Cox regression, as one of the most common survival analysis methods in use today, was used to establish the baseline for performance comparison to novel methods. In their work on Cox models for ADNI data, Li and Luo indicated that the set of RAVLT-Learning, RAVLT-Immediate, FAQ, MMSE, ADAS-COG13, age, and an indicator for the presence of ApoE genes (genes that stimulate the production of apolipoproteins that are strongly correlated with the development of AD and other dementias\textsuperscript{9}) were optimal for this model. In our exploratory data analysis, a backward stepwise feature selection process, with steps based on AIC so as to avoid a multiple testing situation, yielded a similar panel of significant predictor variables: age at the time of MCI diagnosis; an indicator for the presence of ApoE genes; baseline scores for FAQ, the RAVLT-Percent Forgetting and RAVLT-Immediate assessments; and the baseline volume of the hippocampus at the time of MCI diagnosis. The baseline score for the RAVLT-Perecent Forgetting score includes some amount of multicollinearity with the combination of the RAVLT-Immediate score, but robust estimators for the standard errors can be used to compensate for this, and the removal of the either RAVLT score reduces the model's predictive strength. With these covariates, the basic cox model is:
+
+$h_i(t) = h_0(t) * exp\{\gamma_1age_i + \gamma_2I(ApoE)_i + \gamma_3MMSE_i + \gamma_4FAQ_i + \gamma_5HippocampusVolume_i + \gamma_6RAVLTPercForgetting_i + \gamma_7RAVLTImmediate_i \}$
+
+Using the 402 MCI patients in the ADNI-1 protocol that Li and Luo used as a case study, two types of optimal thresholds for the classification of an event have been provided: an MSE-optimal prediction threshold, and a diagnostic-optimal threshold where at least 90% of observed events in the test data set are detected at or before their diagnosis. At the MSE-otpimal threshold of `r base_cox_optimal$cutoff`, the basic cox model shows moderate performance with regards to both early event detection and the margin of error; `r base_cox_optimal$CAUGHT_EARLY_n` cases were detected early out of `r max(thresholds$CAUGHT_EARLY_n, na.rm=TRUE)` known events events, and the margin of error at the MSE-optimal threshold was `r base_cox_optimal$avg.margin.early` months. With diagnostic capability prioritized, a more appropriate threshold would be 0.95, where 36 cases are detected early, and the margin of error is 10.75 months. Both thresholds are plotted below for all models discussed, with the MSE and early detection rates, and significant predictors will be discussed subsequently.
+
+```{r cox_basic_summary, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+cox_summary       <- data.frame(variable = c( 'Age', 'ApoE Present Indicator', 'MMSE baseline score',
+                                              'RAVLT % Forgetting baseline score', 'FAQ baseline score',
+                                              'Hippocampus baseline volume', 'RAVLT Immediate baseline score'),
+                                round(summary(cox_basic)$coef, 3) )
+cox_summary_table <- cox_summary %>% 
+                      dplyr::select(-z) %>%
+                      rename('Variable'=1, 'Coefficient'=2, 'exp[coef]'=3, 'SE'=4,'p-value'=5)
+
+knitr::kable(cox_summary_table, caption= 'Basic cox model', row.names=FALSE)
+
+```
+
+### 2.2 Random Survival Forest Model \
+
+The random survival forest (RSF) is a relatively new model developed by Ishwaran et. al\textsuperscript{10} as a variant of the standard random forest, customized for the analysis of right-censored survival data. Several recent iterations on the random survival forest by the original creators and others have yielded a model that is more conservative for survival analysis than using standard random forests, and is becoming an increasingly common part of the toolkit for survival analysis studies. While the use of RSF models for fundamental prediction of AD progression using the ADNI demonstrated has been demonstrated\textsuperscript{11} previously, and this model is considered as a motivating step illustrating the iterative progress toward our proposed new model.
+
+The importance metric used in this model's diagnostics is the Breiman-Cutler Importance Score\textsuperscript{12}, and the baseline scores for FAQ, ADAS-COG13, and RAVLT-Immediate are overwhelmingly the most important predictors in this model. These are the only three variables to reach scores of 0.15, 0.1, and 0.05, respectively, and no other variable has a score greater than 0.3. Three variables are largely trivial to the model's performance: The patient's gender and age, and the indicator for the presence of ApoE genes.
+
+```{r RSF_basic_model_diags, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE, fig.height=3}
+
+grid.arrange(RSF_basic_error_rate_plot, basic_VIMP_plot, nrow=1, ncol=2)
+```
+
+A moderately-sized RSF model was developed for this study with 400 trees, and a complete scope of 20 neurocognitive assessments and biometric measurements. At the MSE-optimal threshold of `r RSF_optimal$cutoff`, the RSF model detects just `r RSF_optimal$CAUGHT_EARLY_n` cases early, which is considerably weaker performance than the Cox model. Similarly, the margin of error for the RSF model is greater than that of the basic cox model, at `r metrics[metrics$model=='Cox (MSE)',]$margin`. Conversely, at the diagnostic-optimal suggested threshold of 0.91, an early detection rate of 90% with a margin of error of 10.5 months illustrate better performance for the RSF model than for the basic cox model.
+
+
+```{r showPlots, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+################################## COMBINE AND PLOT #################################################################
+ggarrange(coxplot, RSFplot, MFPCA.coxplot, MFPCA.RSFplot,
+          ncol=2, nrow=2, common.legend = TRUE, legend="bottom")
+
+```
+
+## 3. New Models
+
+### 3.1 MFPCCox \
+
+MFPCCox is a method suggested by Li and Luo that uses a two-phase approach to predict the progression from MCI to AD. MFPCCox first uses MFPCA components to extract a series of principal component predictors from a series of predictors, in this case five neurocognitive assessment scores that were highlighted as particularly promising predictors (MMSE, FAQ, ACOG-13, and both RAVLT Learning and Immediate). After these components are generated, a Cox regression is constructed that uses the same panel of variables as the basic cox model, as well as the MFPCA component scores, as predictors for the hazard of the event occurrence at a given time point. With the inclusion of these five MFPCA components $X_1,..., X_5$, we have the MFPCCox model: 
+
+$h_i(t) = h_0(t) * exp\{\gamma_1age_i + \gamma_2I(ApoE)_i + \gamma_3MMSE_i + \gamma_4FAQ_i + \gamma_5HippocampusVolume_i + \gamma_6RAVLTPercForgetting_i + \gamma_7RAVLTImmediate_i + \gamma_8 X_{1,i} + \gamma_9 X_{2,i} + \gamma_{10} X_{3,i} + \gamma_{11} X_{4,i} + \gamma_{12} X_{5,i} \}$
+
+While this method shows technical promise and has computational advantages over other current methods joint modeling (JM), the high degree of missingness in the ADNI data makes MFPCA component approximation less reliable, even when FACE/PACE approximations are leveraged for numerical stability. At the MSE-optimal prediction threshold of  `r MFPCCox_optimal$cutoff`, at which level there are `r MFPCCox_optimal$CAUGHT_EARLY_n` of `r max(thresholds_MFPCCox$CAUGHT_EARLY_n,na.rm=TRUE)` AD progressions detected early, and the margin of error was `r metrics[metrics$model=='MFPCCox (MSE)',]$margin` months. This model successfully detects cases at a better rate than the basic RSF model, and also does so with a significantly smaller margin of error. Conversely, at the diagnostic-optimal suggested prediction threshold of 0.95, the MFPCCox model shows substantially performance compared to both the basic cox regression model and the basic RSF model, with a margin of error of 10.75 months, only slightly larger than the basic RSF model, and nearly one full month less than the basic cox model.
+
+```{r MFPCCox_summary, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+# MFPCA_ mary       <- data.frame(variable = c( 'Age', 'ApoE Present Indicator', 'MMSE baseline score',
+#                                               'RAVLT % Forgetting baseline score', 'FAQ baseline score',
+#                                               'Hippocampus baseline volume', 'RAVLT Immediate baseline score'),
+#                                 round(summary(cox_basic)$coef, 3) )
+# cox_summary_table <- cox_summary %>% 
+#                       dplyr::select(-z) %>%
+#                       rename('Variable'=1, 'Coefficient'=2, 'exp[coef]'=3, 'SE'=4,'p-value'=5)
+# 
+# knitr::kable(cox_summary_table, caption= 'Basic cox model', row.names=FALSE)
+# 
+# summary(MFPCCox.fit)
+
+```
+
+
+### 3.2 MFPCA-Augmented RSF \
+
+This model serves as an iteration on both the MFPCCox method and traditional RSF models, and as a new framework to complement the work done by Lin, Li, and Luo\textsuperscript{13} in developing a dynamic framework for predicting a patient's AD progression. Where MFPCCox is intended for an evolving prediction over the course of a patient's medical journey, this model provides potentially better predictions for when a patient's MCI will progress to AD as we incorporate both the capability of random forests models to account for complex interactions, and the augmented predictive power that we are afforded by incorporating logitudinal observations via the MFPCA components as predictors. In this new method, we construct a random survival forest of 400 trees using the complete complement of available neurocognitive assessments and biological measurements, as well as the first five MFPCA components generated similarly to the MFPCCox process. Because this method is intended for use only at the first diagnosis of MCI, the patient's MFPCA components must be estimated using a series of linear regressions. We first compute the first five MFPCA components for all individuals in the training data set, and then we use a series of linear models to predict these five components for each individual in the test data set based on a series of significant predictors: gender, age, years of education, FAQ, MMSE, ADAS-COG13, ADAS-Q4, and three RAVLT scores (forgetting, immediate, learning). These estimates are generated for a given patient and then used to acquire survival probability estimates from the RSF model.
+
+```{r RSF_MFPCA_model_diags, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE, fig.height=3}
+
+grid.arrange(RSF_MFPCA_error_rate_plot, MFPCA_VIMP_plot, nrow=1, ncol=2)
+```
+
+Of the four multivariate models assessed, the MFPCA-augmented RSF model has the strongest prediction performance at both the MSE-optimal and diagnostic-optimal prediction thresholds, but the variance grows substantially at the diagnostic-optimal threshold. At the MSE-optimal threshold of `r RSF_MFPCA_optimal$cutoff`, the RSF model detects `r RSF_MFPCA_optimal$CAUGHT_EARLY_n` cases early, more than any of the basic cox, basic RSF, or MFPCCox models. Conversely, a margin of error of `r round(metrics[metrics$model=='RSF-MFPCA (MSE)',]$margin, 3)` is substantially larger than those of the cox or MFPCCox models, while being marginally better than the basic RSF model. While the model's margin of error is reasonable at the MSE-optimal threshold, that measure deteriorates drastically at the suggested diagnostic-optimal threshold, where 92.5% of cases are detected early, but the margin of error is 12.1 months, greater than any other model's diagnostic-optimal threshold margin of error.
+
+The MFPCA-Augmented RSF model shows a considerably lower error at all tree counts than the basic RSF model. The maximum error rate for the augmented model's is 0.301, while the lowest error rate for the basic model is at approximately the long term asymptotic level of 0.24. The basic model converged much faster than the augmented model, with the basic model converging at a size of approximately 80 trees, while the augmented model showed a strong dip in the error rate at sizes between 40 and 130 trees, before converging to the asymptotic errror rate at approximately 200 trees. The importance measures for the MFPCA-augmented RSF model are generally aligned with the variable importance measures from the basic model, with the first MFPCA component being overwhelmingly the most most important in tree decisions, followed far behind by the second MFPCA component. The order of importance for the non-MFPCA predictor variables remains mostly unchanged, with the exceptions of the ADAS-Q4 score and the whole brain volume measures falling several places in the augmented model's VIMP plot, although the relative difference in these variables' importance measures and those of the variables that passed them are small.
+
+
+## 4. Discussion and Conclusion
+
+We have developed a framework for an MFPCA-augmented RSF model that incorporates longitudinal information from the training data and then simulates that same inclusion in predictions. MFPCA was used to condense the information from a series of variables into several informative features regarding the trajectory of a patient's MCI-to-AD progression over time, which are then estimated for new data so that predictions can be made at the time of first MCI diagnosis. Similar to how MFPCCox iterates upon basic cox regression and joint modeling approaches by condensing the included longitudinal information into MFPCA score predictors, MFPCA-augmented RSF iterates from both time-zero RSF prediction models and the framework suggested by Lin, Li, and Luo\textsuperscript{14} for an MFPCCox-parallel method using RSF. This new method makes that same modeling approach available without the collection of the prediction subject's longitudinal data, primarily with the goal of early intervention in mind.
+
+```{r ShowMetrics, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+knitr::kable(as.data.frame(metrics) %>%
+             select(-CAUGHT_EARLY_n) %>%
+              rename('Model (Threshold Type)' = 1, 
+                     'Threshold'              = 2, 
+                     'MSE'                    = 3, 
+                     'C-Index'                = 4,
+                     'Early Detection Rate'   = 5, 
+                     'Avg. Margin of Error'   = 6), 
+             "pipe", caption= 'Model Performance', row.names = FALSE)
+```
+
+Because RSF is nonparametric, it makes no assumptions about the underlying distribution and can more effectively model the complex interactions between predictors, as well as potential nonlinear effects. This is increasingly important as the number of available predictors increases into the dozens, as in the ADNI study, or more; at these points, it becomes infeasible to consider all possible interactions between these terms, and inference regarding variable selection becomes increasingly difficult. The inherently more graceful approach with which random forests handle large variable sets provides for better calibration and a less manual process of model diagnostics review and model refinement.
+
+In application to the ADNI-1 data set, MFPCA-augmented RSF has been shown to have greater early prediction rates at both the MSE-optimal and diagnostic-optimal prediction thresholds than cox regression, basic RSF, and MFPCCox, although MFPCCox has a marginally greater C-index score when the model is reduced to a binary classifier for early prediction. This suggests that MFPCA-augmented RSF has advantages over comparable cox-based methods as the number of influential predictors increases, but that was less of a concern in this application, where only five variables showed significant p-values for their effect on survival, and two more had consequential effects for the predictive accuracy of the model.
+
+Further improvements to the model would potentially be achievable with an interval-based series of MFPCA-augmented random forest binary classifiers, an approach to survival analysis previously suggested by Tibshirani and Zhong\textsuperscript{15}, but this comes with the inherent loss of censoring information, which may lead to excess bias in the estimates of the survival outcomes\textsuperscript{16}.
+
+As a future research direction, we consider the possibility of improving the quality of the MFPCA component regressions via the addition of nonlinear and interaction terms. Overall, we believe that we have demonstrated the efficacy of MFPCA-augmented RSF in providing a useful predictive tool for making an estimate of the time to AD diagnosis, at the time of the initial MCI diagnosis.
+
+## Acknowledgements
+
+The data used in preparation of this paper were collected by the Alzheimer's Disease Neuroimaging Initiative at UCLA (adni.loni.ucla.edu), and researchers from the ADNI project provided these data, but did not participate in the analysis or writing of this paper. The full list of ADNI researchers can be found at http://adni.loni.ucla.edu/wp-content/uploads/how_to_apply/ADNI_Acknowledgement_List.pdf.
+
+#### Declaration of Conflicting Interests
+
+The author(s) declare no potential conflicts of interest with respect to the research, authorship, and/or publication of this article.
+
+#### Data Availability Statement
+
+The data used in this article were obtained from the Alzheimer’s Disease Neuroimaging Initiative (ADNI) database (adni.loni.usc.edu), from the ADNI-1 protocol group. The ADNI is a public-private partnership launched in 2003 by  Principal Investigator Michael W. Weiner, MD, with the primary goal of testing whether serial magnetic resonance imaging (MRI), positron emission tomography (PET), other biological markers, and clinical and neuropsychological assessment can be combined to measure the progression of mild cognitive impairment (MCI) and early Alzheimer’s disease (AD). For up-to-date information, see www.adni-info.org
+
+
+## References
+
+1. Li K, Luo S. Dynamic prediction of Alzheimer’s disease progression using features of multiple longitudinal outcomes and time‐to‐event data. Statistics in Medicine. 2019;38(24):4804-4818. doi:https://doi.org/10.1002/sim.8334
+
+2. Alzheimer's Association. What is Alzheimer’s? Alzheimer’s Disease and Dementia. Published 2019. https://www.alz.org/alzheimers-dementia/what-is-alzheimers#basics
+
+3. Woodard JL. Geriatric Neuropsychological Assessment. In: Handbook of Assessment in Clinical Gerontology (Second Edition). Academic Press; 2010:461-501. doi:https://doi.org/10.1016/b978-0-12-374961-1.10018-1
+
+4. MAYO AM. Measuring Functional Status in Older Adults With Dementia. Try This: Best Practices in Nursing Care to Older Adults with dementia. 2008;(D13):212-213. doi:https://doi.org/10.1097/01.nur.0000325364.08303.0e
+
+5. Dementia Care Central. Mini-Mental State Exam (MMSE) Test for Alzheimer’s / Dementia. Dementia Care Central. Published February 26, 2025. https://www.dementiacarecentral.com/mini-mental-state-exam/
+
+6. Kueper JK, Speechley M, Montero-Odasso M. The Alzheimer’s Disease Assessment Scale–Cognitive Subscale (ADAS-Cog): Modifications and Responsiveness in Pre-Dementia Populations. A Narrative Review. Journal of Alzheimer’s Disease. 2018;63(2):423-444. doi:https://doi.org/10.3233/jad-170991
+
+7. ADNI | About. Alzheimer’s Disease Neuroimaging Initiative. https://adni.loni.usc.edu/about/
+
+8. Gonzalez-Ortiz F, Kac PR, Brum WS, Zetterberg H, Blennow K, Karikari TK. Plasma phospho-tau in Alzheimer’s disease: towards diagnostic and therapeutic trial applications. Molecular Neurodegeneration. 2023;18(1). doi:https://doi.org/10.1186/s13024-023-00605-8
+
+9. Toledo JB, Vanderstichele H, Figurski M, et al. Factors affecting A$\beta$ plasma levels and their utility as biomarkers in ADNI. Acta Neuropathologica. 2011;122(4). doi:https://doi.org/10.1007/s00401-011-0861-8
+
+10. Ishwaran H, Kogalur UB, Blackstone EH, Lauer MS. Random survival forests. The Annals of Applied Statistics. 2008;2(3):841-860. doi:https://doi.org/10.1214/08-aoas169
+
+11. Raulin AC, Doss SV, Trottier ZA, Ikezu TC, Bu G, Liu CC. ApoE in Alzheimer’s disease: pathophysiology and therapeutic strategies. Molecular Neurodegeneration. 2022;17(1). doi:https://doi.org/10.1186/s13024-022-00574-4
+
+12. Lu M, Ishwaran H. Discussion on “Nonparametric variable importance assessment using machine learning techniques” by Brian D. Williamson, Peter B. Gilbert, Marco Carone, and Noah Simon. Biometrics. 2020;77(1):23-27. doi:https://doi.org/10.1111/biom.13391
+
+13. Song S, Asken B, Armstrong MJ, Yang Y, Li Z. Predicting Progression to Clinical Alzheimer’s Disease Dementia Using the Random Survival Forest. Journal of Alzheimer’s disease. 2023;95(2):535-548. doi:https://doi.org/10.3233/jad-230208
+
+14. Lin J, Li K, Luo S. Functional survival forests for multivariate longitudinal outcomes: Dynamic prediction of Alzheimer’s disease progression. Statistical Methods in Medical Research. 2020;30(1):99-111. doi:https://doi.org/10.1177/0962280220941532
+
+15. Tibshirani R, Zhong C. Survival analysis as a classification problem. Published September 27, 2019. Accessed July 21, 2025. https://arxiv.org/pdf/1909.11171
+
+16. Leung KM, Elashoff RM, Afifi AA. CENSORING ISSUES IN SURVIVAL ANALYSIS. Annual Review of Public Health. 1997;18(1):83-104. doi:https://doi.org/10.1146/annurev.publhealth.18.1.83
+
+
+
+## Appendix
+
+
+
+
+
+
+
+
+
+
+Code is made availabel through GitHub at X
